@@ -14,7 +14,20 @@ import os
 import logging
 from ipyplot import plot_images
 import math
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+import torch.multiprocessing as mp
+import random
 
+def safe_state(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
 # Load the Objects365 dataset
 class Object365_Dataset(Dataset):
     def __init__(self, annots_dir, img_dir, transform=None, target_transform=None):
@@ -23,11 +36,11 @@ class Object365_Dataset(Dataset):
         self.transform = transform # tfm for the imgs
         self.target_transform = target_transform # tfm for the labels
         # Get the list of files
-        self.data_list = [ l[:-4] for l in os.listdir(annots_dir) if (l.endswith(".txt") and 
+        self.data_list = sorted([ l[:-4] for l in os.listdir(annots_dir) if (l.endswith(".txt") and 
                                                                  (os.stat(
                                                                      os.path.join(self.annots_dir, l)
                                                                      ).st_size != 0) 
-                                                                 )] # Select only jpgs, ~ 14MB
+                                                                 )]) # Select only annots, ~ 14MB
         img_list = [ i for i in os.listdir(img_dir) if i.endswith(".jpg") ] # Select only jpgs, ~ 14MB
         # Data Validation
         assert len(self.data_list) > 0, "Wrong annotations path"
@@ -46,7 +59,15 @@ class Object365_Dataset(Dataset):
         if self.transform: img = self.transform(img)
         if self.target_transform: annot = self.target_transform(annot, img) # transform to the sam2 format
         return [img, annot, filename] # single img, single MD-annot, single filename
-    
+
+def StateFulDataLoader(DataLoader):
+    # def __init__(self, *args, **kwargs):
+    #     super().__init__(*args, **kwargs)
+    # TODO: Check the idx processed in the batch, and save list of idx processed.
+    # TODO: Check the savefile for the idx processed, and skip those idx.
+    # TODO: Write a try catch block & write to IO, the bitmap of processed images.
+    pass
+
 def img_tfm(image): # Stays CHW
     # image = torch.permute(image, (1,2,0)) 
     return image
@@ -171,29 +192,16 @@ def segment_data(unroll_img_batch, colored_masks):
         temp = np.transpose(temp, (1,2,0)) # convert to HWC
         unroll_sam_out.append(temp)
     return unroll_sam_out
-# %%
-if __name__=="__main__":
-    logging.basicConfig(format='%(levelname)s | %(asctime)s.%(msecs)03d | %(module)s:%(lineno)d > %(message)s',datefmt='%H.%M.%S', level=logging.INFO)
-    # %%
-    logging.info("Loading the dataset")
-    # Load the dataset
-    annots_dir = "/mnt/data/Objects365/labels/train/"
-    img_dir = "/mnt/data/Objects365/images/train/"
-    new_dim = 512
-    bs=1
-    # write_img_annot_stats(annots_dir, img_dir)
-    dset = Object365_Dataset(annots_dir, img_dir, img_tfm, xywh_rel_to_xyxy_abs)
-    logging.info(f"len of dataset {dset.__len__()}") # img --> HWC, annot --> (N, 5)
-    test_loader = DataLoader(dset, batch_size=bs, shuffle=False, collate_fn=collate_fn) # TODO: Save the generator state in dataloader, Write your own sampler and pass to DataLoader.
-    # Write the code for resuming capability here.
-    logging.info("Instantiating sam2-hiera-large model")
-    # Instantiate the sam model
-    predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
-    
+
+def run_inference(predictor, test_loader, logging, rank, world_size):
+    # Distributed computing code
+    sd.to(rank)
+
     # Write a loop that iterates over the test_loader
     for data in tqdm(test_loader, desc="Processing dataset"):
         logging.debug(f"Unrolling {len(data[0])} instances")
         unroll_img_batch, unroll_bbox_batch, unroll_filename = unroll_data(*data)
+        # Set the model to inference mode
         with torch.inference_mode():
             logging.info(f"Set image batch of {len(unroll_img_batch)} images")
             predictor.set_image_batch(unroll_img_batch) # Enter HWC
@@ -208,6 +216,35 @@ if __name__=="__main__":
             for i, img in enumerate(unroll_crop_out):
                 with open(f"/mnt/data/Objects365/processed/train/{unroll_filename[i]}.jpg", "wb") as f:
                     img.save(f)
+
+# %%
+if __name__=="__main__":
+    # Arguments
+    safe_state() # Set all the seeds
+    logging.basicConfig(format='%(levelname)s | %(asctime)s.%(msecs)03d | %(module)s:%(lineno)d > %(message)s',datefmt='%H.%M.%S', level=logging.INFO)
+    annots_dir = "/mnt/data/Objects365/labels/train/"
+    img_dir = "/mnt/data/Objects365/images/train/"
+    new_dim = 512
+    bs=1
+    rank=world_size=2
+    is_distributed=True
+    # %%
+    logging.info("Loading the dataset")
+    # Load the dataset
+    dist.init_process_group(rank=rank, world_size=world_size)
+    dset = Object365_Dataset(annots_dir, img_dir, img_tfm, xywh_rel_to_xyxy_abs)
+    # distributed sampler
+    sampler = DistributedSampler(dset) if is_distributed else None
+    logging.info(f"len of dataset {dset.__len__()}") # img --> HWC, annot --> (N, 5)
+    test_loader = StateFulDataLoader(dset, batch_size=bs, shuffle=False, collate_fn=collate_fn, sampler=sampler) 
+    # Write the code for resuming capability here.
+    logging.info("Instantiating sam2-hiera-large model")
+    # Instantiate the sam model
+    predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
+    # Run Inference 
+    mp.spawn(run_inference, 
+             args=(predictor, test_loader, logging, rank, world_size), 
+             nprocs=world_size, join=True)
                     
 
 '''
