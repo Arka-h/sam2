@@ -145,10 +145,13 @@ class SAM2ImagePredictor:
         assert isinstance(image_list, list)
         self._orig_hw = []
         for image in image_list:
-            assert isinstance(
-                image, np.ndarray
-            ), "Images are expected to be an np.ndarray in RGB format, and of shape  HWC"
-            self._orig_hw.append(image.shape[:2])
+            if isinstance(image, (np.ndarray, Image)):
+                self._orig_hw.append(image.shape[:2])
+            elif isinstance(image, torch.Tensor):
+                self._orig_hw.append(image.shape[1:])
+            else:
+                raise AssertionError("Expected to be an np.ndarray in RGB format, of shape HWC or PIL Image or torch.Tensor: CHW")
+                
         # Transform the image to the form expected by the model
         img_batch = self._transforms.forward_batch(image_list)
         img_batch = img_batch.to(self.device)
@@ -156,7 +159,7 @@ class SAM2ImagePredictor:
         assert (
             len(img_batch.shape) == 4 and img_batch.shape[1] == 3
         ), f"img_batch must be of size Bx3xHxW, got {img_batch.shape}"
-        logging.info("Computing image embeddings for the provided images...")
+        logging.debug("Computing image embeddings for the provided images...")
         backbone_out = self.model.forward_image(img_batch)
         _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
         # Add no_mem_embed, which is added to the lowest rest feat. map during training on videos
@@ -170,7 +173,7 @@ class SAM2ImagePredictor:
         self._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
         self._is_image_set = True
         self._is_batch = True
-        logging.info("Image embeddings computed.")
+        logging.debug("Image embeddings computed.")
 
     def predict_batch(
         self,

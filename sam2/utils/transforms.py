@@ -9,6 +9,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from torchvision.transforms import Normalize, Resize, ToTensor
 
 
@@ -37,10 +38,11 @@ class SAM2Transforms(nn.Module):
     def __call__(self, x):
         x = self.to_tensor(x)
         return self.transforms(x)
-
-    def forward_batch(self, img_list):
-        img_batch = [self.transforms(self.to_tensor(img)) for img in img_list]
+    
+    def forward_batch(self, img_list): # Want CHW here
+        img_batch = [self.transforms(img.float()/255.0) if torch.is_tensor(img) else self.transforms(self.to_tensor(img)) for img in img_list]
         img_batch = torch.stack(img_batch, dim=0)
+        logging.debug(f"Transforms: {img_batch[0].shape}")
         return img_batch
 
     def transform_coords(
