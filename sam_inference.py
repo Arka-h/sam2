@@ -11,15 +11,22 @@ import cv2
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
-import logging
+import logging as log
 from ipyplot import plot_images
 import math
+import traceback
+import argparse
+
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
 
 # Load the Objects365 dataset
 class Object365_Dataset(Dataset):
-    def __init__(self, annots_dir, img_dir, transform=None, target_transform=None):
+    def __init__(self, annots_dir, img_dir, target_dir, transform=None, target_transform=None, resume=True):
         self.annots_dir = annots_dir
         self.img_dir = img_dir
+        self.target_dir = target_dir
         self.transform = transform # tfm for the imgs
         self.target_transform = target_transform # tfm for the labels
         # Get the list of files
@@ -29,9 +36,17 @@ class Object365_Dataset(Dataset):
                                                                      ).st_size != 0) 
                                                                  )] # Select only jpgs, ~ 14MB
         img_list = [ i for i in os.listdir(img_dir) if i.endswith(".jpg") ] # Select only jpgs, ~ 14MB
+        log.info(f"Found {len(self.data_list)} annotations")
         # Data Validation
         assert len(self.data_list) > 0, "Wrong annotations path"
         assert len(img_list) > 0, "Wrong images path"
+        
+        if resume: # Remove Repetition;    data: objects365_v2_01692748_11_0.jpg -> 5 parts, need first 3
+            log.info(f"Removing processed files from the list")
+            processed_list = [ i[:-4].split("_") for i in os.listdir(target_dir) if i.endswith(".jpg") ] # (N, 5)
+            processed_list = set([ "_".join(i[:3])for i in processed_list ]) # Remove the last two parts, remove duplicates
+            self.data_list = list(filter(lambda x: x not in processed_list, self.data_list)) # Remove already processed files
+            log.info(f"Found {len(self.data_list)} annotations")
         
     def __len__(self):
         return len(self.data_list)
@@ -125,7 +140,16 @@ def unroll_data(batch_img, batch_annot, batch_filename):
         unroll_img_batch.extend([batch_img[i]]*unroll_count[i])
         unroll_bbox_batch.extend([bbox[1:] for bbox in batch_annot[i]])
         unroll_filename.extend([f"{batch_filename[i]}_{bbox[0]}_{j}" for j, bbox in enumerate(batch_annot[i])])
-    # Image embeddings are computed here
+    # Check for empty bbox, and remove them
+    temp = torch.stack(unroll_bbox_batch)
+    is_empty = (temp[:, 0]==temp[:, 2])|(temp[:,1]==temp[:,3])
+    if torch.any(is_empty):
+        idx = torch.where(is_empty)[0] # torch.where() Always returns a tuple of tensor with multiple indices
+        log.info(f"Empty bbox found in {[unroll_filename[i] for i in idx]}")
+        unroll_img_batch = [element for i, element in enumerate(unroll_img_batch) if i not in idx ]
+        unroll_bbox_batch = [element for i, element in enumerate(unroll_bbox_batch) if i not in idx ]
+        unroll_filename = [element for i, element in enumerate(unroll_filename) if i not in idx ]
+        log.info(f"bbox(s) not processed")
     return unroll_img_batch, unroll_bbox_batch, unroll_filename
 
 def crop_img(unroll_sam_out, unroll_bbox_batch, new_dim=512, padding=0.06):
@@ -134,10 +158,10 @@ def crop_img(unroll_sam_out, unroll_bbox_batch, new_dim=512, padding=0.06):
     for i, img in enumerate(unroll_sam_out):
         img = Image.fromarray(img)
         canvas = np.zeros((new_dim,new_dim,3), dtype=np.uint8)
-        logging.debug(f"bbox: {unroll_bbox_batch[i]}")
+        log.debug(f"bbox: {unroll_bbox_batch[i]}")
         crop_img = img.crop(np.array(unroll_bbox_batch[i]))
         w_crop,h_crop = crop_img.size
-        logging.debug(f"Image size: {w_crop}x{h_crop}")
+        log.debug(f"Image size: {w_crop}x{h_crop}")
         pad_dim = new_dim-padding # Automatically pads the image
         if w_crop>h_crop:
             w_new, h_new = pad_dim, int(h_crop*(pad_dim/w_crop))
@@ -162,96 +186,76 @@ def segment_data(unroll_img_batch, colored_masks):
     colored_masks, unroll_filename = colored_masks
     unroll_sam_out = []
     for i, img in enumerate(unroll_img_batch):
-        # logging.info(f"{colored_masks[i].shape}, {colored_masks[i].mean(axis=0).shape}, {img.shape}")
+        # log.info(f"{colored_masks[i].shape}, {colored_masks[i].mean(axis=0).shape}, {img.shape}")
         temp = colored_masks[i].mean(axis=0).astype('bool')  # Convert to int, for mask operation | CWH
-        # logging.info(f"Mask shape: {temp.shape}")
+        # log.info(f"Mask shape: {temp.shape}")
         temp = np.repeat(temp[np.newaxis, :, :], 3, axis=0) # Increase dim of the mask to 3 | 1WH->CWH
-        logging.debug(f"Mask shape unroll: {temp.shape}, {img.shape}, {unroll_filename}")
+        log.debug(f"Mask shape unroll: {temp.shape}, {img.shape}, {unroll_filename}")
         temp = temp * (img.cpu().detach().numpy()) # Apply mask to image
         temp = np.transpose(temp, (1,2,0)) # convert to HWC
         unroll_sam_out.append(temp)
     return unroll_sam_out
 # %%
 if __name__=="__main__":
-    logging.basicConfig(format='%(levelname)s | %(asctime)s.%(msecs)03d | %(module)s:%(lineno)d > %(message)s',datefmt='%H.%M.%S', level=logging.INFO)
+    p = argparse.ArgumentParser(description="Inference pipeline[SAM2] for localization")
+    p.add_argument("--log", help="log level", default="INFO")
+    args = p.parse_args()
+    log.basicConfig(format='%(levelname)s | %(asctime)s.%(msecs)03d | %(module)s:%(lineno)d > %(message)s',datefmt='%H.%M.%S', level=log.getLevelName(args.log))
     # %%
-    logging.info("Loading the dataset")
+    log.info("Loading the dataset")
     # Load the dataset
     annots_dir = "/mnt/data/Objects365/labels/train/"
     img_dir = "/mnt/data/Objects365/images/train/"
+    target_dir = "/mnt/data/Objects365/processed/train/"
     new_dim = 512
-    bs=1
+    dl_bs=8
+    bs=16
     # write_img_annot_stats(annots_dir, img_dir)
-    dset = Object365_Dataset(annots_dir, img_dir, img_tfm, xywh_rel_to_xyxy_abs)
-    logging.info(f"len of dataset {dset.__len__()}") # img --> HWC, annot --> (N, 5)
-    test_loader = DataLoader(dset, batch_size=bs, shuffle=False, collate_fn=collate_fn) # TODO: Save the generator state in dataloader, Write your own sampler and pass to DataLoader.
+    dset = Object365_Dataset(annots_dir, img_dir, target_dir, img_tfm, xywh_rel_to_xyxy_abs)
+    log.info(f"len of dataset {dset.__len__()}") # img --> HWC, annot --> (N, 5)
+    log.info(f"dl_bs: {4}, batch_size: {bs}")
+    test_loader = DataLoader(dset, batch_size=dl_bs, shuffle=False, collate_fn=collate_fn) # TODO: Save the generator state in dataloader, Write your own sampler and pass to DataLoader.
     # Write the code for resuming capability here.
-    logging.info("Instantiating sam2-hiera-large model")
+    log.info("Instantiating sam2-hiera-large model")
     # Instantiate the sam model
     predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
     
     # Write a loop that iterates over the test_loader
-    for data in tqdm(test_loader, desc="Processing dataset"):
-        logging.debug(f"Unrolling {len(data[0])} instances")
-        unroll_img_batch, unroll_bbox_batch, unroll_filename = unroll_data(*data)
-        with torch.inference_mode():
-            logging.info(f"Set image batch of {len(unroll_img_batch)} images")
-            predictor.set_image_batch(unroll_img_batch) # Enter HWC
-            logging.debug(f"Predicting Masks")
-            colored_masks, scores, _ = predictor.predict_batch(box_batch=unroll_bbox_batch) # 
-            logging.debug(f"Segment according to masks")
-            unroll_sam_out = segment_data(unroll_img_batch, [colored_masks, unroll_filename]) # List of np arrays
-            logging.debug(f"Cropping & resizing the images (default: 512)")
-            unroll_crop_out = crop_img(unroll_sam_out, unroll_bbox_batch) # List of PIL images
-            logging.debug(f"Saving the images")
-            # Save the images
-            for i, img in enumerate(unroll_crop_out):
-                with open(f"/mnt/data/Objects365/processed/train/{unroll_filename[i]}.jpg", "wb") as f:
-                    img.save(f)
-                    
-
-'''
-import pynvml
-
-def get_available_gpu(min_free_memory=1024):  # min_free_memory in MB
-    """Returns the ID of the first GPU with sufficient free memory, or None if none are available."""
-    pynvml.nvmlInit()
-    device_count = pynvml.nvmlDeviceGetCount()
-    for device_id in range(device_count):
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
-        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        free_memory_mb = mem_info.free / 1024**2
-        if free_memory_mb > min_free_memory:
-            return device_id
-    return None
-
-def process_batches(model, dataloader):
-    """Processes batches of data using a model, switching GPUs dynamically."""
-    for batch_idx, batch_data in enumerate(dataloader):
-        # Check available GPU before processing
-        available_gpu = get_available_gpu(min_free_memory=1024)  # Set a threshold for free memory
-        if available_gpu is None:
-            print("No GPU available with sufficient memory. Exiting.")
-            break
-        
-        # Transfer model and data to the selected GPU
-        device = torch.device(f"cuda:{available_gpu}")
-        model.to(device)
-        inputs, labels = batch_data[0].to(device), batch_data[1].to(device)
-        
-        try:
-            # Forward pass
-            outputs = model(inputs)
-            # Add your loss calculation, backward pass, and optimization here
-            print(f"Batch {batch_idx} processed on GPU {available_gpu}")
-        except RuntimeError as e:
-            print(f"RuntimeError on GPU {available_gpu}: {e}")
-            break
-
-# Example Usage
-# Assuming `model` is your PyTorch model and `dataloader` is a DataLoader
-# Make sure the DataLoader provides batches of (inputs, labels)
-model = ...  # Define or load your model
-dataloader = ...  # Define your DataLoader
-process_batches(model, dataloader)
-'''
+    processed_file = '' # Use for cleanup
+    try:
+        for data in tqdm(test_loader, desc="Processing dataset (img, annot)"):
+            unroll_img_batch, unroll_bbox_batch, unroll_filename = unroll_data(*data) # Unroll the data to feed into the model
+            log.debug(f"Unrolled into {len(unroll_img_batch)} instances")
+            with torch.inference_mode():
+                # Shard output into smaller batches
+                for s in tqdm(range(0, len(unroll_img_batch), bs), desc="Processing shard (unrolled)"):
+                    unroll_img_shard, unroll_bbox_shard, unroll_file_shard = unroll_img_batch[s:s+bs], unroll_bbox_batch[s:s+bs], unroll_filename[s:s+bs]
+                    log.debug(f"Setting Image batch")
+                    predictor.set_image_batch(unroll_img_shard) # Set the image batch
+                    log.debug(f"Predicting Masks")
+                    colored_masks, scores, _ = predictor.predict_batch(box_batch=unroll_bbox_shard) # 
+                    log.debug(f"Segment according to masks")
+                    unroll_sam_out = segment_data(unroll_img_shard, [colored_masks, unroll_file_shard]) # List of np arrays
+                    log.debug(f"Cropping & resizing the images (default: 512)")
+                    unroll_crop_out = crop_img(unroll_sam_out, unroll_bbox_shard) # List of PIL images
+                    log.debug(f"Saving the images")
+                    # Save the images
+                    for i, img in enumerate(unroll_crop_out):
+                        with open(f"{target_dir}/{unroll_file_shard[i]}.jpg", "wb") as f:
+                            img.save(f)
+                            processed_file = unroll_file_shard[i]
+                    # log.debug(f"Processed {unroll_file_shard}")
+    except KeyboardInterrupt:
+        log.info("Process interrupted, cleaning up files...")
+        processed = processed_file.split("_")
+        filename = "_".join(processed[:3])
+        n=0
+        with open(os.path.join(annots_dir, filename+".txt"), 'r') as f: n = len(f.readlines())
+        if n > (int(processed[4])+1): # 5th element is the line number in the annot file
+            os.system(f"rm {target_dir}/{filename}*.jpg") # Remove partially processed files; # to include in next dataset
+        exit(0)
+    except Exception as e:
+        log.info(f"Error occurred on file: {processed_file}")
+        log.error(f"Error: {e}")
+        traceback.print_exc()
+        exit(1)
