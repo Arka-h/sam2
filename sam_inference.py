@@ -47,7 +47,7 @@ class Object365_Dataset(Dataset):
             processed_list = set([ "_".join(i[:3])for i in processed_list ]) # Remove the last two parts, remove duplicates
             self.data_list = list(filter(lambda x: x not in processed_list, self.data_list)) # Remove already processed files
             log.info(f"Found {len(self.data_list)} annotations")
-        
+
     def __len__(self):
         return len(self.data_list)
         
@@ -197,6 +197,19 @@ def segment_data(unroll_img_batch, colored_masks):
     return unroll_sam_out
 # %%
 if __name__=="__main__":
+    """
+    # Manual calculations of data speed:
+    6410 batches of 8 images each with average image size of (664 GB)/1742391 ~ 400 KB
+    6000 Ada: 6410*8*400/(1024**2) ~ 20 GB of input images processed in 40 hrs.
+    20 * (48/40) ~ 24 GB of input images processed in 48 hrs. (Hence we shall store 25GB of images in each directory)
+
+    Q. So how many files per user to dump during a training run?
+    > 25*1024**2/400 = 65536 --> 65600
+    """
+    uname = [
+        "arkahaldi", "akanksha1", "dharmasai", "rishig", "sekhar", "shyam.marjit"
+    ] # 6 x 25 = 150GB processed at a time
+    chunk_sz = 65600
     p = argparse.ArgumentParser(description="Inference pipeline[SAM2] for localization")
     p.add_argument("--log", help="log level", default="INFO")
     args = p.parse_args()
@@ -213,20 +226,20 @@ if __name__=="__main__":
     # write_img_annot_stats(annots_dir, img_dir)
     dset = Object365_Dataset(annots_dir, img_dir, target_dir, img_tfm, xywh_rel_to_xyxy_abs)
     log.info(f"len of dataset {dset.__len__()}") # img --> HWC, annot --> (N, 5)
-    log.info(f"dl_bs: {4}, batch_size: {bs}")
+    log.info(f"dl_bs: {dl_bs}, batch_size: {bs}")
     test_loader = DataLoader(dset, batch_size=dl_bs, shuffle=False, collate_fn=collate_fn) # TODO: Save the generator state in dataloader, Write your own sampler and pass to DataLoader.
     # Write the code for resuming capability here.
     log.info("Instantiating sam2-hiera-large model")
     # Instantiate the sam model
     predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
-    
+    predictor.model.to("cuda:1")
     # Write a loop that iterates over the test_loader
     processed_file = '' # Use for cleanup
     try:
         for data in tqdm(test_loader, desc="Processing dataset (img, annot)"):
             unroll_img_batch, unroll_bbox_batch, unroll_filename = unroll_data(*data) # Unroll the data to feed into the model
             log.debug(f"Unrolled into {len(unroll_img_batch)} instances")
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 # Shard output into smaller batches
                 for s in tqdm(range(0, len(unroll_img_batch), bs), desc="Processing shard (unrolled)"):
                     unroll_img_shard, unroll_bbox_shard, unroll_file_shard = unroll_img_batch[s:s+bs], unroll_bbox_batch[s:s+bs], unroll_filename[s:s+bs]
